@@ -862,6 +862,34 @@ impl<'db> Type<'db> {
                 self
             }
 
+            // `TypeIs` and `TypeGuard` wrap a single type. When they participate in a cycle, we
+            // need to widen their wrapped types rather than unioning the wrappers together.
+            (Type::TypeIs(prev_type_is), Type::TypeIs(curr_type_is))
+                if prev_type_is.place_info(db) == curr_type_is.place_info(db) =>
+            {
+                curr_type_is.with_type(
+                    db,
+                    curr_type_is.return_type(db).cycle_normalized(
+                        db,
+                        prev_type_is.return_type(db),
+                        cycle,
+                    ),
+                )
+            }
+
+            (Type::TypeGuard(prev_type_guard), Type::TypeGuard(curr_type_guard))
+                if prev_type_guard.place_info(db) == curr_type_guard.place_info(db) =>
+            {
+                curr_type_guard.with_type(
+                    db,
+                    curr_type_guard.return_type(db).cycle_normalized(
+                        db,
+                        prev_type_guard.return_type(db),
+                        cycle,
+                    ),
+                )
+            }
+
             _ => {
                 // Also avoid unioning in a previous type which contains a Divergent from the
                 // current cycle, if the most-recent type does not. This cannot cause an
@@ -5345,9 +5373,19 @@ impl<'db> Type<'db> {
             }
 
             // TODO(jelle): Materialize should be handled differently, since TypeIs is invariant
-            Type::TypeIs(type_is) => type_is.with_type(db, type_is.return_type(db).apply_type_mapping(db, type_mapping, tcx)),
+            Type::TypeIs(type_is) => type_is.with_type(
+                db,
+                type_is
+                    .return_type(db)
+                    .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
+            ),
 
-            Type::TypeGuard(type_guard) => type_guard.with_type(db, type_guard.return_type(db).apply_type_mapping(db, type_mapping, tcx)),
+            Type::TypeGuard(type_guard) => type_guard.with_type(
+                db,
+                type_guard
+                    .return_type(db)
+                    .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
+            ),
 
             Type::TypeAlias(alias) => {
                 // For EagerExpansion, expand the raw value type. This path relies on Salsa's cycle
