@@ -24,7 +24,9 @@ use crate::types::constraints::{
 };
 use crate::types::generics::{GenericContext, InferableTypeVars, walk_generic_context};
 use crate::types::infer::infer_deferred_types;
-use crate::types::relation::{HasRelationToVisitor, IsDisjointVisitor, TypeRelation};
+use crate::types::relation::{
+    HasRelationToVisitor, IsDisjointVisitor, TypeRelation, TypeRelationChecker,
+};
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType,
     FindLegacyTypeVarsVisitor, KnownClass, MaterializationKind, ParamSpecAttrKind, SelfBinding,
@@ -1724,6 +1726,26 @@ impl<'db> VarianceInferable<'db> for &Signature<'db> {
             Some(self.return_ty.variance_of(db, typevar)),
         )
         .collect()
+    }
+}
+
+impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
+    pub(super) fn check_callable_signature_pair(
+        &self,
+        db: &'db dyn Db,
+        source: &CallableSignature<'db>,
+        target: &CallableSignature<'db>,
+    ) -> ConstraintSet<'db, 'c> {
+        CallableSignature::has_relation_to_inner(
+            db,
+            &source.overloads,
+            &target.overloads,
+            self.constraints,
+            self.inferable,
+            self.relation,
+            self.relation_visitor,
+            self.disjointness_visitor,
+        )
     }
 }
 

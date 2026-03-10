@@ -17,7 +17,9 @@ use crate::types::constraints::{
 use crate::types::enums::is_single_member_enum;
 use crate::types::generics::{InferableTypeVars, walk_specialization};
 use crate::types::protocol_class::{ProtocolClass, walk_protocol_interface};
-use crate::types::relation::{HasRelationToVisitor, IsDisjointVisitor, TypeRelation};
+use crate::types::relation::{
+    HasRelationToVisitor, IsDisjointVisitor, TypeRelation, TypeRelationChecker,
+};
 use crate::types::tuple::{TupleSpec, TupleType, walk_tuple_type};
 use crate::types::{
     ApplyTypeMappingVisitor, ClassBase, ClassLiteral, FindLegacyTypeVarsVisitor,
@@ -137,45 +139,38 @@ impl<'db> Type<'db> {
             SynthesizedProtocolType::new(ProtocolInterface::with_property_members(db, members)),
         ))
     }
+}
 
-    /// Return `true` if `self` conforms to the interface described by `protocol`.
-    #[expect(clippy::too_many_arguments)]
-    pub(super) fn satisfies_protocol<'c>(
-        self,
+impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
+    /// Return `true` if `ty` conforms to the interface described by `protocol`.
+    pub(super) fn check_type_satisfies_protocol(
+        &self,
         db: &'db dyn Db,
+        ty: Type<'db>,
         protocol: ProtocolInstanceType<'db>,
-        constraints: &'c ConstraintSetBuilder<'db>,
-        inferable: InferableTypeVars<'_, 'db>,
-        relation: TypeRelation,
-        relation_visitor: &HasRelationToVisitor<'db, 'c>,
-        disjointness_visitor: &IsDisjointVisitor<'db, 'c>,
     ) -> ConstraintSet<'db, 'c> {
         // `self` might satisfy the protocol nominally, if `protocol` is a class-based protocol and
         // `self` has the protocol class in its MRO. This is a much cheaper check than the
         // structural check we perform below, so we do it first to avoid the structural check when
         // we can.
-        let mut result = ConstraintSet::from_bool(constraints, false);
+        let mut result = ConstraintSet::from_bool(self.constraints, false);
+
         if let Some(nominal_instance) = protocol.to_nominal_instance() {
             // if `self` and `other` are *both* protocols, we also need to treat `self` as if it
             // were a nominal type, or we won't consider a protocol `P` that explicitly inherits
             // from a protocol `Q` to be a subtype of `Q` to be a subtype of `Q` if it overrides
             // `Q`'s members in a Liskov-incompatible way.
-            let type_to_test = self
+            let type_to_test = ty
                 .as_protocol_instance()
                 .and_then(ProtocolInstanceType::to_nominal_instance)
                 .map(Type::NominalInstance)
-                .unwrap_or(self);
-            let nominally_satisfied = type_to_test.has_relation_to_impl(
-                db,
-                Type::NominalInstance(nominal_instance),
-                constraints,
-                inferable,
-                relation,
-                relation_visitor,
-                disjointness_visitor,
-            );
+                .unwrap_or(ty);
+
+            let nominally_satisfied =
+                self.check_type_pair(db, type_to_test, Type::NominalInstance(nominal_instance));
+
             if result
-                .union(db, constraints, nominally_satisfied)
+                .union(db, self.constraints, nominally_satisfied)
                 .is_always_satisfied(db)
             {
                 return result;
@@ -186,44 +181,32 @@ impl<'db> Type<'db> {
         // methods (except `__iter__`, but that returns the self type recursively, so it can't rule
         // out assignability). We don't want generators with different return types to be
         // assignable to each other. In this case we use the result of the nominal check above.
-        if let Some(self_protocol) = self.as_protocol_instance()
-            && let Protocol::FromClass(self_class) = self_protocol.inner
+        if let Some(source_protocol) = ty.as_protocol_instance()
+            && let Protocol::FromClass(source_class) = source_protocol.inner
             && let Protocol::FromClass(proto_class) = protocol.inner
-            && self_class.known(db) == Some(KnownClass::Generator)
-            && proto_class.known(db) == Some(KnownClass::Generator)
+            && source_class.is_known(db, KnownClass::Generator)
+            && proto_class.is_known(db, KnownClass::Generator)
             && Program::get(db).python_version(db) < PythonVersion::PY313
         {
             return result;
         }
 
-        let structurally_satisfied = if let Type::ProtocolInstance(self_protocol) = self {
-            self_protocol.interface(db).has_relation_to_impl(
+        let structurally_satisfied = if let Type::ProtocolInstance(self_protocol) = ty {
+            self.check_protocol_interface_pair(
                 db,
+                self_protocol.interface(db),
                 protocol.interface(db),
-                constraints,
-                inferable,
-                relation,
-                relation_visitor,
-                disjointness_visitor,
             )
         } else {
             protocol
                 .inner
                 .interface(db)
                 .members(db)
-                .when_all(db, constraints, |member| {
-                    member.is_satisfied_by(
-                        db,
-                        self,
-                        constraints,
-                        inferable,
-                        relation,
-                        relation_visitor,
-                        disjointness_visitor,
-                    )
+                .when_all(db, self.constraints, |member| {
+                    self.check_type_satisfies_protocol_member(db, ty, &member)
                 })
         };
-        result.or(db, constraints, || structurally_satisfied)
+        result.or(db, self.constraints, || structurally_satisfied)
     }
 }
 
@@ -730,16 +713,15 @@ impl<'db> ProtocolInstanceType<'db> {
             _: (),
         ) -> bool {
             let constraints = ConstraintSetBuilder::new();
-            Type::object()
-                .satisfies_protocol(
-                    db,
-                    protocol,
-                    &constraints,
-                    InferableTypeVars::None,
-                    TypeRelation::Subtyping,
-                    &HasRelationToVisitor::default(&constraints),
-                    &IsDisjointVisitor::default(&constraints),
-                )
+            let checker = TypeRelationChecker {
+                constraints: &constraints,
+                relation: TypeRelation::Subtyping,
+                inferable: InferableTypeVars::None,
+                relation_visitor: &HasRelationToVisitor::default(&constraints),
+                disjointness_visitor: &IsDisjointVisitor::default(&constraints),
+            };
+            checker
+                .check_type_satisfies_protocol(db, Type::object(), protocol)
                 .is_always_satisfied(db)
         }
 
